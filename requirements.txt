@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+openai
+httpx
+python-dotenv
+resend
+pydantic
+python-multipart
