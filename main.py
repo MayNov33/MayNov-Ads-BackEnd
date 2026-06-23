@@ -1,9 +1,12 @@
 import os
 import json
 import base64
+import hmac
+import hashlib
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI, OpenAIError
@@ -24,6 +27,17 @@ DEFAULT_MODEL_PLAN_2 = "gpt-4.1-mini"
 DEFAULT_MODEL_PLAN_3 = "gpt-4.1"
 
 MAX_TOKENS_BY_PLAN = {1: 2000, 2: 3000, 3: 3500}
+
+SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
+
+# Variant IDs des produits Ads Shopify
+VARIANT_ADS_PLAN_1 = "58089123873116"  # Plan Essentielle Ads 3,90€
+VARIANT_ADS_PLAN_2 = "58089137897820"  # Plan Ciblée Plateforme Ads 7,90€
+VARIANT_ADS_PLAN_3 = "58089147138396"  # Plan Avancée Persona Ads 14,90€
+
+# Stockage commandes Ads
+# Format : { "1042": {"email": "client@email.com", "plan": 2} }
+commandes_autorisees: Dict[str, Any] = {}
 
 client: Optional[OpenAI] = None
 if OPENAI_API_KEY:
@@ -596,6 +610,91 @@ def call_openai_ads(
     sections_complete = {**sections_part1, **sections_part2}
     return {"rapport_sections": sections_complete}
 
+# =========================
+# MODÈLE VÉRIFICATION
+# =========================
+
+class VerificationRequest(BaseModel):
+    order_number: str
+    email: str
+
+
+# =========================
+# WEBHOOK SHOPIFY ADS
+# =========================
+
+@app.post("/webhook/commande")
+async def webhook_commande(request: Request):
+    body = await request.body()
+
+    if SHOPIFY_WEBHOOK_SECRET:
+        hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
+        computed = hmac.new(
+            SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
+            body,
+            hashlib.sha256,
+        ).digest()
+        computed_b64 = base64.b64encode(computed).decode("utf-8")
+        if not hmac.compare_digest(computed_b64, hmac_header):
+            print("Webhook signature invalide")
+            return JSONResponse(status_code=200, content={"ok": False})
+
+    try:
+        data = json.loads(body)
+        order_number = str(data.get("order_number", "")).strip()
+        email = (data.get("email") or "").strip().lower()
+
+        if order_number and email:
+            plan_detecte = 1
+            line_items = data.get("line_items", [])
+            for item in line_items:
+                variant_id = str(item.get("variant_id", ""))
+                if variant_id == VARIANT_ADS_PLAN_2:
+                    plan_detecte = 2
+                elif variant_id == VARIANT_ADS_PLAN_3:
+                    plan_detecte = 3
+            commandes_autorisees[order_number] = {
+                "email": email,
+                "plan": plan_detecte,
+            }
+            print(f"Commande Ads enregistrée : #{order_number} → {email} → Plan {plan_detecte}")
+
+    except Exception as e:
+        print(f"Erreur webhook Ads : {e}")
+
+    return JSONResponse(status_code=200, content={"ok": True})
+
+
+# =========================
+# VÉRIFICATION COMMANDE ADS
+# =========================
+
+@app.post("/verifier/commande")
+async def verifier_commande(req: VerificationRequest):
+    order = req.order_number.strip().lstrip("#")
+    email = req.email.strip().lower()
+
+    commande = commandes_autorisees.get(order)
+
+    if commande is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Numéro de commande introuvable. Vérifiez votre email de confirmation.",
+        )
+
+    if commande["email"] != email:
+        raise HTTPException(
+            status_code=403,
+            detail="L'email ne correspond pas à cette commande.",
+        )
+
+    return {
+        "ok": True,
+        "message": "Accès autorisé",
+        "email": email,
+        "order_number": order,
+        "plan": commande["plan"],
+    }
 
 # =========================
 # ROUTES
