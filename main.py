@@ -831,7 +831,7 @@ async def analyser_ads_persona(
         persona=persona
     )
 
-    @app.post("/analyser/ads/basique/rapport")
+@app.post("/analyser/ads/basique/rapport")
 async def analyser_ads_basique_rapport(
     file: UploadFile = File(...),
     email: str = Form(...)
