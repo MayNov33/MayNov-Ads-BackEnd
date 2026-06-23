@@ -697,6 +697,88 @@ async def verifier_commande(req: VerificationRequest):
     }
 
 # =========================
+# SECTIONS TO PLAIN TEXT
+# =========================
+
+def sections_to_plain_text_ads(sections: Dict[str, Any]) -> str:
+    parts = []
+
+    def add(title: str, body: str) -> None:
+        if body and str(body).strip():
+            parts.append(f"{title}\n{body}".strip())
+
+    # Sections communes aux 3 plans
+    add("Accroche visuelle", sections.get("accroche_visuelle", ""))
+    add("Clarté du message", sections.get("clarte_message", ""))
+    add("Analyse du CTA", sections.get("cta_analyse", ""))
+    add("Cohérence de la marque", sections.get("coherence_marque", ""))
+
+    # Plan 2 — codes plateforme
+    add("Codes Meta", sections.get("codes_meta", ""))
+    add("Codes TikTok", sections.get("codes_tiktok", ""))
+
+    # Plan 3 — persona
+    add("Codes Meta (persona)", sections.get("codes_meta_persona", ""))
+    add("Codes TikTok (persona)", sections.get("codes_tiktok_persona", ""))
+    add("Lecture du persona", sections.get("lecture_persona", ""))
+    add("Adéquation persona", sections.get("adequation_persona", ""))
+
+    # Recommandations
+    recos = sections.get("recommandations") or {}
+    if isinstance(recos, dict):
+        parts.append("Recommandations priorisées")
+        parts.append("Priorité 1 :\n" + str(recos.get("priorite_1", "")))
+        parts.append("Priorité 2 :\n" + str(recos.get("priorite_2", "")))
+        parts.append("Priorité 3 :\n" + str(recos.get("priorite_3", "")))
+
+    # Résumé
+    add("Résumé rapide", sections.get("resume_rapide", ""))
+
+    return "\n\n".join(p for p in parts if p.strip())
+
+# =========================
+# EMAIL VIA RESEND
+# =========================
+
+import resend as resend_client
+
+def send_rapport_ads_by_email(email: str, plan: int, rapport_texte: str) -> None:
+    plan_names = {
+        1: "Plan Essentielle Ads",
+        2: "Plan Ciblée Plateforme Ads",
+        3: "Plan Avancée Persona Ads"
+    }
+    plan_name = plan_names.get(plan, f"Plan {plan}")
+    RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+    if not RESEND_API_KEY:
+        print("RESEND_API_KEY manquante, email non envoyé.")
+        return
+    resend_client.api_key = RESEND_API_KEY
+    try:
+        resend_client.Emails.send({
+            "from": "MayNov <rapport@maynov.fr>",
+            "to": email,
+            "subject": f"Votre rapport MayNov Ads — {plan_name}",
+            "html": f"""
+<div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px;">
+  <div style="background:#1d3557;padding:16px 24px;border-radius:12px;margin-bottom:24px;">
+    <span style="color:white;font-size:20px;font-weight:900;">MAY<span style="color:#8fd19e;">NOV</span> <span style="color:#f4a261;font-size:14px;">ADS</span></span>
+  </div>
+  <h2 style="color:#1d3557;">Votre rapport d'analyse pub est prêt ✅</h2>
+  <p style="color:#475569;">Voici votre rapport <strong>{plan_name}</strong>. Conservez cet email pour y revenir à tout moment.</p>
+  <div style="background:#f2f2f2;border-radius:12px;padding:20px;margin:20px 0;white-space:pre-wrap;font-size:14px;line-height:1.7;color:#1a1a1a;">
+{rapport_texte}
+  </div>
+  <p style="color:#475569;font-size:13px;">Des questions ? Contactez-nous à <a href="mailto:contact@maynov.fr">contact@maynov.fr</a></p>
+  <p style="color:#94a3b8;font-size:11px;">© 2026 MayNov · maynov.fr</p>
+</div>
+            """,
+        })
+        print(f"Email Ads envoyé à {email} pour {plan_name}")
+    except Exception as e:
+        print(f"Erreur envoi email Resend Ads : {e}")
+
+# =========================
 # ROUTES
 # =========================
 
@@ -748,3 +830,71 @@ async def analyser_ads_persona(
         plateforme=plateforme,
         persona=persona
     )
+
+    @app.post("/analyser/ads/basique/rapport")
+async def analyser_ads_basique_rapport(
+    file: UploadFile = File(...),
+    email: str = Form(...)
+):
+    image_base64, image_type = await read_and_encode_image(file)
+    data = call_openai_ads(
+        plan=1,
+        image_base64=image_base64,
+        image_type=image_type,
+        plateforme=None,
+        persona=None
+    )
+    sections = data["rapport_sections"]
+    rapport_texte = sections_to_plain_text_ads(sections)
+    if email:
+        send_rapport_ads_by_email(email, 1, rapport_texte)
+    return {"plan": 1, "rapport_sections": sections, "rapport_texte": rapport_texte}
+
+
+@app.post("/analyser/ads/plateforme/rapport")
+async def analyser_ads_plateforme_rapport(
+    file: UploadFile = File(...),
+    plateforme: str = Form(...),
+    email: str = Form(...)
+):
+    if plateforme not in ["meta", "tiktok"]:
+        raise HTTPException(status_code=400, detail="Plateforme invalide. Valeurs acceptées : meta, tiktok.")
+    image_base64, image_type = await read_and_encode_image(file)
+    data = call_openai_ads(
+        plan=2,
+        image_base64=image_base64,
+        image_type=image_type,
+        plateforme=plateforme,
+        persona=None
+    )
+    sections = data["rapport_sections"]
+    rapport_texte = sections_to_plain_text_ads(sections)
+    if email:
+        send_rapport_ads_by_email(email, 2, rapport_texte)
+    return {"plan": 2, "rapport_sections": sections, "rapport_texte": rapport_texte}
+
+
+@app.post("/analyser/ads/persona/rapport")
+async def analyser_ads_persona_rapport(
+    file: UploadFile = File(...),
+    plateforme: str = Form(...),
+    persona: str = Form(...),
+    email: str = Form(...)
+):
+    if plateforme not in ["meta", "tiktok"]:
+        raise HTTPException(status_code=400, detail="Plateforme invalide. Valeurs acceptées : meta, tiktok.")
+    if not persona or not persona.strip():
+        raise HTTPException(status_code=400, detail="Persona manquant pour ce plan.")
+    image_base64, image_type = await read_and_encode_image(file)
+    data = call_openai_ads(
+        plan=3,
+        image_base64=image_base64,
+        image_type=image_type,
+        plateforme=plateforme,
+        persona=persona
+    )
+    sections = data["rapport_sections"]
+    rapport_texte = sections_to_plain_text_ads(sections)
+    if email:
+        send_rapport_ads_by_email(email, 3, rapport_texte)
+    return {"plan": 3, "rapport_sections": sections, "rapport_texte": rapport_texte}
