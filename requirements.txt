@@ -6,3 +6,4 @@ python-dotenv
 resend
 pydantic
 python-multipart
+psycopg2-binary

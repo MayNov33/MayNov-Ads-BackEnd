@@ -3,6 +3,8 @@ import json
 import base64
 import hmac
 import hashlib
+import psycopg2
+import psycopg2.extras
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
@@ -30,14 +32,47 @@ MAX_TOKENS_BY_PLAN = {1: 2000, 2: 3000, 3: 3500}
 
 SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 # Variant IDs des produits Ads Shopify
 VARIANT_ADS_PLAN_1 = "58089123873116"  # Plan Essentielle Ads 3,90€
 VARIANT_ADS_PLAN_2 = "58089137897820"  # Plan Ciblée Plateforme Ads 7,90€
 VARIANT_ADS_PLAN_3 = "58089147138396"  # Plan Avancée Persona Ads 14,90€
 
-# Stockage commandes Ads
-# Format : { "1042": {"email": "client@email.com", "plan": 2} }
-commandes_autorisees: Dict[str, Any] = {}
+# =========================
+# BASE DE DONNÉES
+# =========================
+
+def get_db_connection():
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL manquante.")
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
+
+
+def init_db():
+    """Crée la table commandes_ads si elle n'existe pas encore."""
+    if not DATABASE_URL:
+        print("DATABASE_URL manquante, base de données non initialisée.")
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS commandes_ads (
+                order_number       TEXT PRIMARY KEY,
+                email              TEXT NOT NULL,
+                plan               INTEGER NOT NULL,
+                quantite           INTEGER NOT NULL DEFAULT 1,
+                analyses_utilisees INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("Table commandes_ads prête.")
+    except Exception as e:
+        print(f"Erreur initialisation base de données Ads : {e}")
 
 client: Optional[OpenAI] = None
 if OPENAI_API_KEY:
@@ -56,6 +91,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup():
+    init_db()
 
 # =========================
 # REQUEST MODEL
@@ -493,6 +532,45 @@ JSON attendu (deuxième partie) :
 """
 
 # =========================
+# QUOTA : VÉRIFIER ET CONSOMMER UNE ANALYSE
+# =========================
+
+def verifier_et_consommer_ads(order_number: str) -> None:
+    """Vérifie le quota Ads et incrémente si autorisé, sinon lève une erreur HTTP 403."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT quantite, analyses_utilisees FROM commandes_ads WHERE order_number = %s",
+            (order_number,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            cur.close()
+            conn.close()
+            return
+        quantite, analyses_utilisees = row
+        if analyses_utilisees >= quantite:
+            cur.close()
+            conn.close()
+            raise HTTPException(
+                status_code=403,
+                detail="Toutes les analyses de cette commande ont déjà été utilisées."
+            )
+        cur.execute(
+            "UPDATE commandes_ads SET analyses_utilisees = analyses_utilisees + 1 WHERE order_number = %s",
+            (order_number,)
+        )
+        conn.commit()
+        print(f"Quota Ads incrémenté pour commande #{order_number} ({analyses_utilisees + 1}/{quantite})")
+        cur.close()
+        conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Erreur quota commande Ads #{order_number} : {e}")
+
+# =========================
 # LOGIQUE OPENAI
 # =========================
 
@@ -645,19 +723,44 @@ async def webhook_commande(request: Request):
         email = (data.get("email") or "").strip().lower()
 
         if order_number and email:
-            plan_detecte = 1
             line_items = data.get("line_items", [])
+
+            # Détecter le plan Ads le plus élevé commandé
+            plan_detecte = 1
+            quantite_ads = 0
             for item in line_items:
                 variant_id = str(item.get("variant_id", ""))
-                if variant_id == VARIANT_ADS_PLAN_2:
-                    plan_detecte = 2
-                elif variant_id == VARIANT_ADS_PLAN_3:
+                qty = int(item.get("quantity", 1))
+                if variant_id == VARIANT_ADS_PLAN_3:
                     plan_detecte = 3
-            commandes_autorisees[order_number] = {
-                "email": email,
-                "plan": plan_detecte,
-            }
-            print(f"Commande Ads enregistrée : #{order_number} → {email} → Plan {plan_detecte}")
+                    quantite_ads += qty
+                elif variant_id == VARIANT_ADS_PLAN_2 and plan_detecte < 3:
+                    plan_detecte = 2
+                    quantite_ads += qty
+                elif variant_id == VARIANT_ADS_PLAN_1:
+                    quantite_ads += qty
+
+            # Ne rien enregistrer si aucun produit Ads dans la commande
+            if quantite_ads == 0:
+                print(f"Commande #{order_number} : aucun produit Ads détecté, ignorée.")
+                return JSONResponse(status_code=200, content={"ok": True})
+
+            # Upsert en base commandes_ads
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO commandes_ads (order_number, email, plan, quantite, analyses_utilisees)
+                VALUES (%s, %s, %s, %s, 0)
+                ON CONFLICT (order_number) DO UPDATE
+                    SET email    = EXCLUDED.email,
+                        plan     = EXCLUDED.plan,
+                        quantite = EXCLUDED.quantite
+            """, (order_number, email, plan_detecte, quantite_ads))
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            print(f"Commande Ads enregistrée : #{order_number} → {email} → Plan {plan_detecte} → Quantité {quantite_ads}")
 
     except Exception as e:
         print(f"Erreur webhook Ads : {e}")
@@ -674,7 +777,15 @@ async def verifier_commande(req: VerificationRequest):
     order = req.order_number.strip().lstrip("#")
     email = req.email.strip().lower()
 
-    commande = commandes_autorisees.get(order)
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM commandes_ads WHERE order_number = %s", (order,))
+        commande = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur base de données : {str(e)}")
 
     if commande is None:
         raise HTTPException(
@@ -688,12 +799,23 @@ async def verifier_commande(req: VerificationRequest):
             detail="L'email ne correspond pas à cette commande.",
         )
 
+    analyses_restantes = commande["quantite"] - commande["analyses_utilisees"]
+
+    if analyses_restantes <= 0:
+        raise HTTPException(
+            status_code=403,
+            detail="Toutes les analyses de cette commande ont déjà été utilisées.",
+        )
+
     return {
         "ok": True,
         "message": "Accès autorisé",
         "email": email,
         "order_number": order,
         "plan": commande["plan"],
+        "quantite": commande["quantite"],
+        "analyses_utilisees": commande["analyses_utilisees"],
+        "analyses_restantes": analyses_restantes,
     }
 
 # =========================
@@ -834,8 +956,10 @@ async def analyser_ads_persona(
 @app.post("/analyser/ads/basique/rapport")
 async def analyser_ads_basique_rapport(
     file: UploadFile = File(...),
-    email: str = Form(...)
+    email: str = Form(...),
+    order_number: str = Form(...)
 ):
+    verifier_et_consommer_ads(order_number.strip().lstrip("#"))
     image_base64, image_type = await read_and_encode_image(file)
     data = call_openai_ads(
         plan=1,
@@ -855,10 +979,12 @@ async def analyser_ads_basique_rapport(
 async def analyser_ads_plateforme_rapport(
     file: UploadFile = File(...),
     plateforme: str = Form(...),
-    email: str = Form(...)
+    email: str = Form(...),
+    order_number: str = Form(...)
 ):
     if plateforme not in ["meta", "tiktok"]:
         raise HTTPException(status_code=400, detail="Plateforme invalide. Valeurs acceptées : meta, tiktok.")
+    verifier_et_consommer_ads(order_number.strip().lstrip("#"))
     image_base64, image_type = await read_and_encode_image(file)
     data = call_openai_ads(
         plan=2,
@@ -879,12 +1005,14 @@ async def analyser_ads_persona_rapport(
     file: UploadFile = File(...),
     plateforme: str = Form(...),
     persona: str = Form(...),
-    email: str = Form(...)
+    email: str = Form(...),
+    order_number: str = Form(...)
 ):
     if plateforme not in ["meta", "tiktok"]:
         raise HTTPException(status_code=400, detail="Plateforme invalide. Valeurs acceptées : meta, tiktok.")
     if not persona or not persona.strip():
         raise HTTPException(status_code=400, detail="Persona manquant pour ce plan.")
+    verifier_et_consommer_ads(order_number.strip().lstrip("#"))
     image_base64, image_type = await read_and_encode_image(file)
     data = call_openai_ads(
         plan=3,
