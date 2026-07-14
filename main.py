@@ -74,6 +74,180 @@ def init_db():
     except Exception as e:
         print(f"Erreur initialisation base de données Ads : {e}")
 
+# =========================
+# CODES D'ACTIVATION ADS
+# =========================
+
+import random
+import string
+
+
+def generer_code_ads() -> str:
+    """Génère un code lisible du type MNA-A3F92K (pas de 0/O ni 1/I pour éviter la confusion)."""
+    alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    suffixe = "".join(random.choices(alphabet, k=6))
+    return f"MNA-{suffixe}"
+
+
+def generer_codes_ads_pour_commande(order_number: str, email: str, line_items: list) -> None:
+    """
+    Pour chaque ligne de la commande Ads, génère un code d'activation par unité achetée,
+    lié au bon plan. Ajout pur : ne touche ni commandes_ads, ni le système
+    quantite/analyses_utilisees existant.
+    """
+    if not DATABASE_URL:
+        print("DATABASE_URL manquante, génération de codes Ads ignorée.")
+        return
+    codes_generes = []
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        for item in line_items:
+            variant_id = str(item.get("variant_id", ""))
+            quantite = int(item.get("quantity", 1))
+
+            if variant_id == VARIANT_ADS_PLAN_2:
+                plan_item = 2
+            elif variant_id == VARIANT_ADS_PLAN_3:
+                plan_item = 3
+            elif variant_id == VARIANT_ADS_PLAN_1:
+                plan_item = 1
+            else:
+                continue  # produit non-Ads dans la commande, on l'ignore
+
+            for _ in range(max(quantite, 1)):
+                code = generer_code_ads()
+                cur.execute(
+                    """
+                    INSERT INTO codes_ads_activation (code, order_number, plan, email_client, utilise)
+                    VALUES (%s, %s, %s, %s, FALSE)
+                    ON CONFLICT (code) DO NOTHING;
+                    """,
+                    (code, order_number, plan_item, email),
+                )
+                codes_generes.append({"code": code, "plan": plan_item})
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"Codes d'activation Ads générés pour la commande #{order_number}.")
+
+        if codes_generes:
+            send_codes_ads_by_email(email, order_number, codes_generes)
+
+    except Exception as e:
+        print(f"Erreur génération codes Ads pour commande #{order_number} : {e}")
+
+def send_codes_ads_by_email(email: str, order_number: str, codes: list) -> None:
+    plan_names = {1: "Plan Essentielle Ads", 2: "Plan Ciblée Plateforme Ads", 3: "Plan Avancée Persona Ads"}
+    RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+    if not RESEND_API_KEY:
+        print("RESEND_API_KEY manquante, email de codes Ads non envoyé.")
+        return
+
+    import resend as resend_client
+    resend_client.api_key = RESEND_API_KEY
+
+    lignes_codes = ""
+    for item in codes:
+        nom_plan = plan_names.get(item["plan"], f"Plan {item['plan']}")
+        lignes_codes += f"""
+        <tr>
+          <td style="background-color:#f2f2f2;border-radius:10px;padding:14px 16px;">
+            <p style="margin:0;font-size:12px;font-weight:700;color:#f4a261;text-transform:uppercase;">{nom_plan}</p>
+            <p style="margin:4px 0 0 0;font-size:22px;font-weight:900;color:#1d3557;letter-spacing:0.04em;">{item['code']}</p>
+          </td>
+        </tr>
+        <tr><td style="height:10px;"></td></tr>
+        """
+
+    try:
+        resend_client.Emails.send({
+            "from": "MayNov <rapport@maynov.fr>",
+            "to": email,
+            "subject": f"Vos codes d'activation MayNov Ads — Commande #{order_number}",
+            "html": f"""
+<div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px;">
+  <div style="background:#1d3557;padding:16px 24px;border-radius:12px;margin-bottom:24px;">
+    <span style="color:white;font-size:20px;font-weight:900;">MAY<span style="color:#8fd19e;">NOV</span> <span style="color:#f4a261;font-size:14px;">ADS</span></span>
+  </div>
+
+  <table width="100%" cellpadding="0" cellspacing="0" border="0">
+    <tr>
+      <td align="center" style="padding-bottom:8px;">
+        <div style="font-size:36px;line-height:1;">✅</div>
+      </td>
+    </tr>
+    <tr>
+      <td align="center" style="padding-bottom:8px;">
+        <h2 style="margin:0;font-size:24px;font-weight:900;color:#1d3557;">Votre commande est confirmée</h2>
+      </td>
+    </tr>
+    <tr>
+      <td align="center" style="padding-bottom:24px;">
+        <p style="margin:0;font-size:14px;color:#475569;line-height:1.6;">Merci pour votre achat ! Voici {'vos codes' if len(codes) > 1 else 'votre code'} d'activation, un par analyse de pub commandée.<br>Utilisez chacun d'eux pour lancer l'analyse correspondante.</p>
+      </td>
+    </tr>
+  </table>
+
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
+    {lignes_codes}
+  </table>
+
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:16px;">
+    <tr>
+      <td align="center">
+        <a href="https://maynov.fr/pages/analyse-ads"
+           style="display:inline-block;background-color:#f19450;color:#ffffff;text-decoration:none;font-size:16px;font-weight:900;padding:16px 40px;border-radius:14px;">
+          Lancer mon analyse →
+        </a>
+      </td>
+    </tr>
+  </table>
+
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
+    <tr>
+      <td align="center">
+        <p style="margin:0;font-size:12px;color:#94a3b8;">Conservez cet email — vos codes vous seront demandés pour lancer vos analyses</p>
+      </td>
+    </tr>
+  </table>
+
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
+    <tr>
+      <td style="border-top:1px solid #e5e7eb;"></td>
+    </tr>
+  </table>
+
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
+    <tr>
+      <td width="33%" align="center" style="padding:16px 8px;background-color:#f2f2f2;border-radius:12px;">
+        <p style="margin:0 0 4px 0;font-size:18px;">🔒</p>
+        <p style="margin:0;font-size:11px;font-weight:700;color:#1d3557;">Paiement sécurisé</p>
+      </td>
+      <td width="4px"></td>
+      <td width="33%" align="center" style="padding:16px 8px;background-color:#f2f2f2;border-radius:12px;">
+        <p style="margin:0 0 4px 0;font-size:18px;">⚡</p>
+        <p style="margin:0;font-size:11px;font-weight:700;color:#1d3557;">Analyse en 30 secondes</p>
+      </td>
+      <td width="4px"></td>
+      <td width="33%" align="center" style="padding:16px 8px;background-color:#f2f2f2;border-radius:12px;">
+        <p style="margin:0 0 4px 0;font-size:18px;">🛡️</p>
+        <p style="margin:0;font-size:11px;font-weight:700;color:#1d3557;">Sans accès admin</p>
+      </td>
+    </tr>
+  </table>
+
+  <p style="color:#475569;font-size:13px;text-align:center;">Des questions ? Contactez-nous à <a href="mailto:contact@maynov.fr">contact@maynov.fr</a></p>
+  <p style="color:#94a3b8;font-size:11px;text-align:center;">© 2026 MayNov · maynov.fr</p>
+</div>
+            """,
+        })
+        print(f"Email de codes Ads envoyé à {email} pour la commande #{order_number}")
+    except Exception as e:
+        print(f"Erreur envoi email codes Ads Resend : {e}")
+
 client: Optional[OpenAI] = None
 if OPENAI_API_KEY:
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -571,6 +745,64 @@ def verifier_et_consommer_ads(order_number: str) -> None:
         print(f"Erreur quota commande Ads #{order_number} : {e}")
 
 # =========================
+# ACTIVATION PAR CODE ADS
+# =========================
+
+class ActivationCodeAdsRequest(BaseModel):
+    code: str
+    email: str
+
+
+def activer_code_ads(code: str, email: str) -> Dict[str, Any]:
+    """
+    Vérifie un code d'activation Ads, le marque comme utilisé, renvoie le plan associé.
+    Lève une HTTPException en cas d'échec (code invalide, déjà utilisé, email incorrect).
+    """
+    code = code.strip().upper()
+    email = email.strip().lower()
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute(
+        "SELECT * FROM codes_ads_activation WHERE code = %s",
+        (code,),
+    )
+    row = cur.fetchone()
+
+    if row is None:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="Code d'activation introuvable.")
+
+    if row["utilise"]:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Ce code a déjà été utilisé.")
+
+    if row["email_client"].strip().lower() != email:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="L'email ne correspond pas à ce code.")
+
+    cur.execute(
+        "UPDATE codes_ads_activation SET utilise = TRUE, date_utilisation = NOW() WHERE code = %s",
+        (code,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    print(f"Code Ads {code} activé pour {email} (plan {row['plan']}).")
+
+    return {
+        "ok": True,
+        "message": "Code activé avec succès",
+        "plan": row["plan"],
+        "order_number": row["order_number"],
+    }
+
+# =========================
 # LOGIQUE OPENAI
 # =========================
 
@@ -762,6 +994,9 @@ async def webhook_commande(request: Request):
 
             print(f"Commande Ads enregistrée : #{order_number} → {email} → Plan {plan_detecte} → Quantité {quantite_ads}")
 
+            # Génération des codes d'activation Ads (un par unité/plan), en parallèle du système existant
+            generer_codes_ads_pour_commande(order_number, email, line_items)
+
     except Exception as e:
         print(f"Erreur webhook Ads : {e}")
 
@@ -817,6 +1052,10 @@ async def verifier_commande(req: VerificationRequest):
         "analyses_utilisees": commande["analyses_utilisees"],
         "analyses_restantes": analyses_restantes,
     }
+
+@app.post("/activer/code")
+async def activer_code_ads_route(req: ActivationCodeAdsRequest):
+    return activer_code_ads(req.code, req.email)
 
 # =========================
 # SECTIONS TO PLAIN TEXT
