@@ -20,7 +20,7 @@ load_dotenv()
 # CONFIG
 # =========================
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -51,7 +51,15 @@ def get_db_connection():
 
 
 def init_db():
-    """Crée la table commandes_ads si elle n'existe pas encore."""
+    """Crée la table commandes_ads si elle n'existe pas encore.
+
+    NOTE (nettoyage juillet 2026) : cette table sert désormais uniquement
+    d'historique/traçabilité des commandes reçues via webhook. Le quota
+    quantite/analyses_utilisees n'est plus consommé nulle part (l'ancien
+    système de vérification par numéro de commande a été retiré, remplacé
+    par les codes d'activation Ads par unité). On garde l'écriture pour ne
+    pas perdre l'historique, mais ces colonnes ne pilotent plus rien.
+    """
     if not DATABASE_URL:
         print("DATABASE_URL manquante, base de données non initialisée.")
         return
@@ -706,45 +714,6 @@ JSON attendu (deuxième partie) :
 """
 
 # =========================
-# QUOTA : VÉRIFIER ET CONSOMMER UNE ANALYSE
-# =========================
-
-def verifier_et_consommer_ads(order_number: str) -> None:
-    """Vérifie le quota Ads et incrémente si autorisé, sinon lève une erreur HTTP 403."""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT quantite, analyses_utilisees FROM commandes_ads WHERE order_number = %s",
-            (order_number,)
-        )
-        row = cur.fetchone()
-        if row is None:
-            cur.close()
-            conn.close()
-            return
-        quantite, analyses_utilisees = row
-        if analyses_utilisees >= quantite:
-            cur.close()
-            conn.close()
-            raise HTTPException(
-                status_code=403,
-                detail="Toutes les analyses de cette commande ont déjà été utilisées."
-            )
-        cur.execute(
-            "UPDATE commandes_ads SET analyses_utilisees = analyses_utilisees + 1 WHERE order_number = %s",
-            (order_number,)
-        )
-        conn.commit()
-        print(f"Quota Ads incrémenté pour commande #{order_number} ({analyses_utilisees + 1}/{quantite})")
-        cur.close()
-        conn.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Erreur quota commande Ads #{order_number} : {e}")
-
-# =========================
 # ACTIVATION PAR CODE ADS
 # =========================
 
@@ -946,15 +915,6 @@ def call_openai_ads(
     return {"rapport_sections": sections_complete}
 
 # =========================
-# MODÈLE VÉRIFICATION
-# =========================
-
-class VerificationRequest(BaseModel):
-    order_number: str
-    email: str
-
-
-# =========================
 # WEBHOOK SHOPIFY ADS
 # =========================
 
@@ -1002,7 +962,8 @@ async def webhook_commande(request: Request):
                 print(f"Commande #{order_number} : aucun produit Ads détecté, ignorée.")
                 return JSONResponse(status_code=200, content={"ok": True})
 
-            # Upsert en base commandes_ads
+            # Upsert en base commandes_ads : historique/traçabilité uniquement
+            # (voir note sur init_db). Protection contre les webhooks dupliqués.
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("""
@@ -1019,7 +980,8 @@ async def webhook_commande(request: Request):
 
             print(f"Commande Ads enregistrée : #{order_number} → {email} → Plan {plan_detecte} → Quantité {quantite_ads}")
 
-            # Génération des codes d'activation Ads (un par unité/plan), en parallèle du système existant
+            # Génération des codes d'activation Ads (un par unité/plan) — c'est
+            # le seul système effectivement utilisé pour donner accès aux analyses.
             generer_codes_ads_pour_commande(order_number, email, line_items)
 
     except Exception as e:
@@ -1027,56 +989,6 @@ async def webhook_commande(request: Request):
 
     return JSONResponse(status_code=200, content={"ok": True})
 
-
-# =========================
-# VÉRIFICATION COMMANDE ADS
-# =========================
-
-@app.post("/verifier/commande")
-async def verifier_commande(req: VerificationRequest):
-    order = req.order_number.strip().lstrip("#")
-    email = req.email.strip().lower()
-
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM commandes_ads WHERE order_number = %s", (order,))
-        commande = cur.fetchone()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur base de données : {str(e)}")
-
-    if commande is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Numéro de commande introuvable. Vérifiez votre email de confirmation.",
-        )
-
-    if commande["email"] != email:
-        raise HTTPException(
-            status_code=403,
-            detail="L'email ne correspond pas à cette commande.",
-        )
-
-    analyses_restantes = commande["quantite"] - commande["analyses_utilisees"]
-
-    if analyses_restantes <= 0:
-        raise HTTPException(
-            status_code=403,
-            detail="Toutes les analyses de cette commande ont déjà été utilisées.",
-        )
-
-    return {
-        "ok": True,
-        "message": "Accès autorisé",
-        "email": email,
-        "order_number": order,
-        "plan": commande["plan"],
-        "quantite": commande["quantite"],
-        "analyses_utilisees": commande["analyses_utilisees"],
-        "analyses_restantes": analyses_restantes,
-    }
 
 @app.post("/activer/code")
 async def activer_code_ads_route(req: ActivationCodeAdsRequest):
