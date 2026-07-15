@@ -755,8 +755,8 @@ class ActivationCodeAdsRequest(BaseModel):
 
 def activer_code_ads(code: str, email: str) -> Dict[str, Any]:
     """
-    Vérifie un code d'activation Ads, le marque comme utilisé, renvoie le plan associé.
-    Lève une HTTPException en cas d'échec (code invalide, déjà utilisé, email incorrect).
+    Vérifie qu'un code d'activation Ads est valide (existe, non utilisé, email correspondant).
+    Ne le marque PAS comme utilisé — ça se fait uniquement au moment de lancer l'analyse.
     """
     code = code.strip().upper()
     email = email.strip().lower()
@@ -764,10 +764,41 @@ def activer_code_ads(code: str, email: str) -> Dict[str, Any]:
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    cur.execute(
-        "SELECT * FROM codes_ads_activation WHERE code = %s",
-        (code,),
-    )
+    cur.execute("SELECT * FROM codes_ads_activation WHERE code = %s", (code,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Code d'activation introuvable.")
+
+    if row["utilise"]:
+        raise HTTPException(status_code=403, detail="Ce code a déjà été utilisé.")
+
+    if row["email_client"].strip().lower() != email:
+        raise HTTPException(status_code=403, detail="L'email ne correspond pas à ce code.")
+
+    return {
+        "ok": True,
+        "message": "Code valide",
+        "plan": row["plan"],
+        "order_number": row["order_number"],
+        "code": code,
+    }
+
+def consommer_code_ads(code: str, email: str) -> int:
+    """
+    Vérifie à nouveau le code (protection contre les doubles soumissions) et le marque
+    comme utilisé. Appelée juste avant de lancer une analyse. Retourne le plan.
+    """
+    code = (code or "").strip().upper()
+    email = (email or "").strip().lower()
+    if not code:
+        raise HTTPException(status_code=400, detail="Code d'activation manquant.")
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM codes_ads_activation WHERE code = %s", (code,))
     row = cur.fetchone()
 
     if row is None:
@@ -778,7 +809,7 @@ def activer_code_ads(code: str, email: str) -> Dict[str, Any]:
     if row["utilise"]:
         cur.close()
         conn.close()
-        raise HTTPException(status_code=403, detail="Ce code a déjà été utilisé.")
+        raise HTTPException(status_code=403, detail="Ce code a déjà été utilisé pour lancer une analyse.")
 
     if row["email_client"].strip().lower() != email:
         cur.close()
@@ -793,14 +824,8 @@ def activer_code_ads(code: str, email: str) -> Dict[str, Any]:
     cur.close()
     conn.close()
 
-    print(f"Code Ads {code} activé pour {email} (plan {row['plan']}).")
-
-    return {
-        "ok": True,
-        "message": "Code activé avec succès",
-        "plan": row["plan"],
-        "order_number": row["order_number"],
-    }
+    print(f"Code Ads {code} consommé pour lancer une analyse (plan {row['plan']}).")
+    return row["plan"]
 
 # =========================
 # LOGIQUE OPENAI
@@ -1196,9 +1221,9 @@ async def analyser_ads_persona(
 async def analyser_ads_basique_rapport(
     file: UploadFile = File(...),
     email: str = Form(...),
-    order_number: str = Form(...)
+    code: str = Form(...)
 ):
-    verifier_et_consommer_ads(order_number.strip().lstrip("#"))
+    consommer_code_ads(code, email)
     image_base64, image_type = await read_and_encode_image(file)
     data = call_openai_ads(
         plan=1,
@@ -1219,11 +1244,11 @@ async def analyser_ads_plateforme_rapport(
     file: UploadFile = File(...),
     plateforme: str = Form(...),
     email: str = Form(...),
-    order_number: str = Form(...)
+    code: str = Form(...)
 ):
     if plateforme not in ["meta", "tiktok"]:
         raise HTTPException(status_code=400, detail="Plateforme invalide. Valeurs acceptées : meta, tiktok.")
-    verifier_et_consommer_ads(order_number.strip().lstrip("#"))
+    consommer_code_ads(code, email)
     image_base64, image_type = await read_and_encode_image(file)
     data = call_openai_ads(
         plan=2,
@@ -1245,13 +1270,13 @@ async def analyser_ads_persona_rapport(
     plateforme: str = Form(...),
     persona: str = Form(...),
     email: str = Form(...),
-    order_number: str = Form(...)
+    code: str = Form(...)
 ):
     if plateforme not in ["meta", "tiktok"]:
         raise HTTPException(status_code=400, detail="Plateforme invalide. Valeurs acceptées : meta, tiktok.")
     if not persona or not persona.strip():
         raise HTTPException(status_code=400, detail="Persona manquant pour ce plan.")
-    verifier_et_consommer_ads(order_number.strip().lstrip("#"))
+    consommer_code_ads(code, email)
     image_base64, image_type = await read_and_encode_image(file)
     data = call_openai_ads(
         plan=3,
