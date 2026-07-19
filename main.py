@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI, OpenAIError
 from dotenv import load_dotenv
+from route_video import router as video_router
 
 load_dotenv()
 
@@ -265,6 +266,7 @@ if OPENAI_API_KEY:
 # =========================
 
 app = FastAPI(title="MayNov Ads Backend", version=APP_VERSION)
+app.include_router(video_router)
 
 app.add_middleware(
     CORSMiddleware,
