@@ -39,6 +39,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 VARIANT_ADS_PLAN_1 = "58089123873116"  # Plan Essentielle Ads 3,90€
 VARIANT_ADS_PLAN_2 = "58089137897820"  # Plan Ciblée Plateforme Ads 7,90€
 VARIANT_ADS_PLAN_3 = "58089147138396"  # Plan Avancée Persona Ads 14,90€
+VARIANT_ADS_VIDEO = "15681853358428"  # Plan Vidéo Ads 14,90€
 
 # =========================
 # BASE DE DONNÉES
