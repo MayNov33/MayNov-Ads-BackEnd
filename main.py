@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI, OpenAIError
 from dotenv import load_dotenv
+from route_video import router as video_router
 
 load_dotenv()
 
@@ -20,7 +21,7 @@ load_dotenv()
 # CONFIG
 # =========================
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -72,9 +73,16 @@ def init_db():
                 email              TEXT NOT NULL,
                 plan               INTEGER NOT NULL,
                 quantite           INTEGER NOT NULL DEFAULT 1,
-                analyses_utilisees INTEGER NOT NULL DEFAULT 0
+                analyses_utilisees INTEGER NOT NULL DEFAULT 0,
+                customer_id        TEXT
             )
         """)
+        # La base existe déjà en prod avec l'ancien schéma (sans customer_id) :
+        # ADD COLUMN IF NOT EXISTS permet d'ajouter la colonne sans casser les
+        # lignes existantes (customer_id restera NULL pour les vieilles commandes
+        # et pour tout achat effectué sans être connecté à un compte client).
+        cur.execute("ALTER TABLE commandes_ads ADD COLUMN IF NOT EXISTS customer_id TEXT")
+        cur.execute("ALTER TABLE codes_ads_activation ADD COLUMN IF NOT EXISTS customer_id TEXT")
         conn.commit()
         cur.close()
         conn.close()
@@ -97,11 +105,11 @@ def generer_code_ads() -> str:
     return f"MNA-{suffixe}"
 
 
-def generer_codes_ads_pour_commande(order_number: str, email: str, line_items: list) -> None:
+def generer_codes_ads_pour_commande(order_number: str, email: str, line_items: list, customer_id: Optional[str] = None) -> None:
     """
     Pour chaque ligne de la commande Ads, génère un code d'activation par unité achetée,
-    lié au bon plan. Ajout pur : ne touche ni commandes_ads, ni le système
-    quantite/analyses_utilisees existant.
+    lié au bon plan. customer_id est l'ID Shopify du client si connecté au moment de
+    l'achat (None sinon) - purement informatif, ne conditionne pas l'accès.
     """
     if not DATABASE_URL:
         print("DATABASE_URL manquante, génération de codes Ads ignorée.")
@@ -128,11 +136,11 @@ def generer_codes_ads_pour_commande(order_number: str, email: str, line_items: l
                 code = generer_code_ads()
                 cur.execute(
                     """
-                    INSERT INTO codes_ads_activation (code, order_number, plan, email_client, utilise)
-                    VALUES (%s, %s, %s, %s, FALSE)
+                    INSERT INTO codes_ads_activation (code, order_number, plan, email_client, utilise, customer_id)
+                    VALUES (%s, %s, %s, %s, FALSE, %s)
                     ON CONFLICT (code) DO NOTHING;
                     """,
-                    (code, order_number, plan_item, email),
+                    (code, order_number, plan_item, email, customer_id),
                 )
                 codes_generes.append({"code": code, "plan": plan_item})
 
@@ -265,6 +273,7 @@ if OPENAI_API_KEY:
 # =========================
 
 app = FastAPI(title="MayNov Ads Backend", version=APP_VERSION)
+app.include_router(video_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -939,6 +948,13 @@ async def webhook_commande(request: Request):
         order_number = str(data.get("order_number", "")).strip()
         email = (data.get("email") or "").strip().lower()
 
+        # Shopify inclut un objet "customer" dans le payload webhook si l'acheteur
+        # était connecté à son compte client au moment de l'achat (absent ou null
+        # pour un achat en invité).
+        customer_obj = data.get("customer") or {}
+        customer_id = customer_obj.get("id")
+        customer_id = str(customer_id) if customer_id else None
+
         if order_number and email:
             line_items = data.get("line_items", [])
 
@@ -967,22 +983,23 @@ async def webhook_commande(request: Request):
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO commandes_ads (order_number, email, plan, quantite, analyses_utilisees)
-                VALUES (%s, %s, %s, %s, 0)
+                INSERT INTO commandes_ads (order_number, email, plan, quantite, analyses_utilisees, customer_id)
+                VALUES (%s, %s, %s, %s, 0, %s)
                 ON CONFLICT (order_number) DO UPDATE
-                    SET email    = EXCLUDED.email,
-                        plan     = EXCLUDED.plan,
-                        quantite = EXCLUDED.quantite
-            """, (order_number, email, plan_detecte, quantite_ads))
+                    SET email       = EXCLUDED.email,
+                        plan        = EXCLUDED.plan,
+                        quantite    = EXCLUDED.quantite,
+                        customer_id = EXCLUDED.customer_id
+            """, (order_number, email, plan_detecte, quantite_ads, customer_id))
             conn.commit()
             cur.close()
             conn.close()
 
-            print(f"Commande Ads enregistrée : #{order_number} → {email} → Plan {plan_detecte} → Quantité {quantite_ads}")
+            print(f"Commande Ads enregistrée : #{order_number} → {email} → Plan {plan_detecte} → Quantité {quantite_ads} → customer_id {customer_id}")
 
             # Génération des codes d'activation Ads (un par unité/plan) — c'est
             # le seul système effectivement utilisé pour donner accès aux analyses.
-            generer_codes_ads_pour_commande(order_number, email, line_items)
+            generer_codes_ads_pour_commande(order_number, email, line_items, customer_id)
 
     except Exception as e:
         print(f"Erreur webhook Ads : {e}")
