@@ -959,21 +959,24 @@ async def webhook_commande(request: Request):
         if order_number and email:
             line_items = data.get("line_items", [])
 
-            # Détecter le plan Ads le plus élevé commandé
+# Détecter le plan Ads le plus élevé commandé
             plan_detecte = 1
             quantite_ads = 0
             for item in line_items:
                 variant_id = str(item.get("variant_id", ""))
                 qty = int(item.get("quantity", 1))
-                if variant_id == VARIANT_ADS_PLAN_3:
+                if variant_id == VARIANT_ADS_VIDEO:
+                    plan_detecte = 4
+                    quantite_ads += qty
+                elif variant_id == VARIANT_ADS_PLAN_3 and plan_detecte < 4:
                     plan_detecte = 3
                     quantite_ads += qty
                 elif variant_id == VARIANT_ADS_PLAN_2 and plan_detecte < 3:
                     plan_detecte = 2
                     quantite_ads += qty
-                elif variant_id == VARIANT_ADS_PLAN_1:
+                elif variant_id == VARIANT_ADS_PLAN_1 and plan_detecte < 2:
                     quantite_ads += qty
-
+                
             # Ne rien enregistrer si aucun produit Ads dans la commande
             if quantite_ads == 0:
                 print(f"Commande #{order_number} : aucun produit Ads détecté, ignorée.")
