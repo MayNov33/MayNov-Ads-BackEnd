@@ -3,6 +3,10 @@ import json
 import base64
 import hmac
 import hashlib
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 import psycopg2
 import psycopg2.extras
 from typing import Optional, Dict, Any
@@ -13,7 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI, OpenAIError
 from dotenv import load_dotenv
-from route_video import router as video_router
 
 load_dotenv()
 
@@ -21,7 +24,7 @@ load_dotenv()
 # CONFIG
 # =========================
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -39,7 +42,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 VARIANT_ADS_PLAN_1 = "58089123873116"  # Plan Essentielle Ads 3,90€
 VARIANT_ADS_PLAN_2 = "58089137897820"  # Plan Ciblée Plateforme Ads 7,90€
 VARIANT_ADS_PLAN_3 = "58089147138396"  # Plan Avancée Persona Ads 14,90€
-VARIANT_ADS_VIDEO = "15681853358428"  # Plan Vidéo Ads 14,90€
+# CORRIGÉ (24/07/2026) : l'ancien ID "15681853358428" était erroné, ce qui
+# empêchait le webhook et la génération de codes de reconnaître les achats
+# vidéo. Le bon ID a été retrouvé via /products/{handle}.js le 23/07/2026.
+VARIANT_ADS_VIDEO = "58317837205852"  # Plan Vidéo Ads 14,90€
 
 # =========================
 # BASE DE DONNÉES
@@ -111,6 +117,10 @@ def generer_codes_ads_pour_commande(order_number: str, email: str, line_items: l
     Pour chaque ligne de la commande Ads, génère un code d'activation par unité achetée,
     lié au bon plan. customer_id est l'ID Shopify du client si connecté au moment de
     l'achat (None sinon) - purement informatif, ne conditionne pas l'accès.
+
+    Plan 1/2/3 = analyses image (Essentielle/Ciblée/Persona).
+    Plan 4 = analyse vidéo. CORRIGÉ (24/07/2026) : cette branche manquait,
+    donc aucun code n'était jamais généré ni envoyé pour les achats vidéo.
     """
     if not DATABASE_URL:
         print("DATABASE_URL manquante, génération de codes Ads ignorée.")
@@ -124,7 +134,9 @@ def generer_codes_ads_pour_commande(order_number: str, email: str, line_items: l
             variant_id = str(item.get("variant_id", ""))
             quantite = int(item.get("quantity", 1))
 
-            if variant_id == VARIANT_ADS_PLAN_2:
+            if variant_id == VARIANT_ADS_VIDEO:
+                plan_item = 4
+            elif variant_id == VARIANT_ADS_PLAN_2:
                 plan_item = 2
             elif variant_id == VARIANT_ADS_PLAN_3:
                 plan_item = 3
@@ -157,7 +169,12 @@ def generer_codes_ads_pour_commande(order_number: str, email: str, line_items: l
         print(f"Erreur génération codes Ads pour commande #{order_number} : {e}")
 
 def send_codes_ads_by_email(email: str, order_number: str, codes: list) -> None:
-    plan_names = {1: "Plan Essentielle Ads", 2: "Plan Ciblée Plateforme Ads", 3: "Plan Avancée Persona Ads"}
+    plan_names = {
+        1: "Plan Essentielle Ads",
+        2: "Plan Ciblée Plateforme Ads",
+        3: "Plan Avancée Persona Ads",
+        4: "Plan Vidéo Ads",  # CORRIGÉ (24/07/2026) : manquait, le plan 4 s'affichait comme "Plan 4"
+    }
     RESEND_API_KEY = os.getenv("RESEND_API_KEY")
     if not RESEND_API_KEY:
         print("RESEND_API_KEY manquante, email de codes Ads non envoyé.")
@@ -203,7 +220,7 @@ def send_codes_ads_by_email(email: str, order_number: str, codes: list) -> None:
     </tr>
     <tr>
       <td align="center" style="padding-bottom:24px;">
-        <p style="margin:0;font-size:14px;color:#475569;line-height:1.6;">Merci pour votre achat ! Voici {'vos codes' if len(codes) > 1 else 'votre code'} d'activation, un par analyse de pub commandée.<br>Utilisez chacun d'eux pour lancer l'analyse correspondante.</p>
+        <p style="margin:0;font-size:14px;color:#475569;line-height:1.6;">Merci pour votre achat ! Voici {'vos codes' if len(codes) > 1 else 'votre code'} d'activation, un par analyse commandée.<br>Utilisez chacun d'eux pour lancer l'analyse correspondante.</p>
       </td>
     </tr>
   </table>
@@ -274,7 +291,6 @@ if OPENAI_API_KEY:
 # =========================
 
 app = FastAPI(title="MayNov Ads Backend", version=APP_VERSION)
-app.include_router(video_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -299,7 +315,7 @@ class AdsAnalyseRequest(BaseModel):
     persona: Optional[str] = None
 
 # =========================
-# CONFIG UPLOAD
+# CONFIG UPLOAD (IMAGE)
 # =========================
 
 MAX_FILE_SIZE_MB = 10
@@ -334,10 +350,35 @@ async def read_and_encode_image(file: UploadFile) -> tuple[str, str]:
     return image_base64, file.content_type
 
 # =========================
-# PROMPTS
+# BLOC COMMUN — VÉRIFICATION STRUCTURELLE + VOIX D'EXPERT
+# (injecté dans les 6 prompts d'analyse image ci-dessous)
 # =========================
 
-PROMPT_ADS_PLAN_1 = """
+BLOC_VERIFICATION_STRUCTURELLE = """
+VÉRIFICATION STRUCTURELLE OBLIGATOIRE — À FAIRE EN PREMIER, AVANT TOUTE ANALYSE PSYCHOLOGIQUE OU DE TON
+
+Avant de rédiger la moindre observation, identifie objectivement si les éléments suivants sont visibles sur CE visuel précis :
+- Un CTA visuellement distinct (bouton, forme cliquable, contraste marqué avec le reste)
+- Le prix ou une indication de valeur
+- Un élément de réassurance (garantie, avis, certification, preuve sociale, retour)
+- Un texte principal réellement lisible en un coup d'œil (taille, contraste, hiérarchie)
+
+Si un de ces éléments est ABSENT, tu ne dois jamais l'interpréter à la place de la cliente ni le noyer dans une reformulation de ton ou de message. Formule-le comme une question ouverte, dans le ton d'un consultant senior qui ne prétend pas connaître la stratégie qu'il n'a pas sous les yeux. Exemple de formulation à adapter à chaque cas concret :
+"Le prix n'apparaît pas sur ce visuel — est-ce un choix volontaire (stratégie de curiosité, prix révélé sur la landing page) ou un oubli ? Si c'est involontaire, c'est un frein direct à la conversion."
+Cette question doit apparaître dans la section concernée (cta_analyse pour le CTA, clarte_message pour la lisibilité, etc.) ET, si l'absence constitue un frein potentiellement bloquant pour la conversion, être reprise explicitement en priorité 1 des recommandations.
+
+EXIGENCE DE VOIX D'EXPERT — NON NÉGOCIABLE
+
+Tu écris comme un consultant senior d'une grande agence, avec une connaissance approfondie et concrète de la conversion publicitaire — pas comme un générateur de texte marketing. Chaque section doit apporter une observation qu'aucune autre section du rapport ne fait. Il est interdit de reformuler un même constat sous un angle légèrement différent dans plusieurs sections pour donner une impression de volume : une section courte et tranchante vaut toujours mieux qu'une section qui délaye une idée déjà énoncée ailleurs. Avant de valider une phrase, vérifie qu'elle n'est pas une reformulation d'une observation déjà faite dans une section précédente.
+
+L'objectif final de toute l'analyse, à chaque section, est unique : déterminer si ce visuel donne envie de s'arrêter, d'en savoir plus, et d'acquérir le produit. Toute observation doit être reliée explicitement à cet objectif de conversion, pas traitée comme un critère isolé.
+""".strip()
+
+# =========================
+# PROMPTS — ANALYSE IMAGE
+# =========================
+
+PROMPT_ADS_PLAN_1 = f"""
 Tu es un expert en création publicitaire et en optimisation de visuels e-commerce.
 
 IMPORTANT : tu dois répondre au format JSON STRICT (et rien d'autre).
@@ -345,6 +386,8 @@ Le JSON doit contenir une clé "rapport_sections".
 
 Ton objectif : analyser ce visuel publicitaire point par point et identifier ce qui fonctionne ou freine sa performance.
 Ton : direct, concret, orienté action. Jamais condescendant.
+
+{BLOC_VERIFICATION_STRUCTURELLE}
 
 RÈGLES ABSOLUES :
 - Zéro invention : chaque observation cite un élément RÉEL visible sur l'image
@@ -371,7 +414,7 @@ Analyse du call-to-action.
 - Le CTA est-il visible et lisible ?
 - Son positionnement dans la composition est-il efficace ?
 - Sa formulation est-elle claire et incitative ?
-- Si absent : quel impact probable sur la performance ?
+- Si absent : pose la question ouverte prévue dans la vérification structurelle, n'affirme jamais un choix à la place de la cliente.
 
 4) coherence_marque
 Cohérence de l'identité visuelle.
@@ -380,36 +423,36 @@ Cohérence de l'identité visuelle.
 - L'impression générale est-elle professionnelle, amateur ou confuse ?
 
 5) recommandations
-3 priorités d'amélioration classées par impact.
+3 priorités d'amélioration classées par impact réel sur la conversion.
 
 INTERDICTION ABSOLUE DE DÉFAUT : ne propose "ajouter un témoignage/preuve sociale", "rassurer sur le confort/la praticité" ou "ajouter un visuel avant/après" QUE si tu as explicitement identifié dans les sections précédentes que cet élément précis manque ET que c'est le frein principal pour CE produit. Ces 3 idées sont interdites par défaut car trop génériques.
 
-À la place, cherche en priorité des leviers spécifiques à ce visuel et ce produit : composition, contraste, choix typographique, ordre de lecture, formulation exacte du texte, choix de l'image principale, couleur du CTA, longueur du message, élément manquant unique à CE produit.
+À la place, cherche en priorité des leviers spécifiques à ce visuel et ce produit : composition, contraste, choix typographique, ordre de lecture, formulation exacte du texte, choix de l'image principale, couleur du CTA, longueur du message, élément structurel manquant identifié dans la vérification structurelle.
 
 Format OBLIGATOIRE :
-"Quoi: [action précise et spécifique à ce visuel]\\nPourquoi: [impact]\\nComment: [étapes]\\nOù: [emplacement]\\nExemple: [concret]"
+"Quoi: [action précise et spécifique à ce visuel]\\nPourquoi: [impact sur la conversion]\\nComment: [étapes]\\nOù: [emplacement]\\nExemple: [concret]"
 
 6) resume_rapide
 "Points forts: ...\\nPoints faibles: ...\\nPar où commencer: ..."
 
 JSON attendu :
-{
-  "rapport_sections": {
+{{
+  "rapport_sections": {{
     "accroche_visuelle": "...",
     "clarte_message": "...",
     "cta_analyse": "...",
     "coherence_marque": "...",
-    "recommandations": {
+    "recommandations": {{
       "priorite_1": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ...",
       "priorite_2": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ...",
       "priorite_3": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ..."
-    },
+    }},
     "resume_rapide": "Points forts: ...\\nPoints faibles: ...\\nPar où commencer: ..."
-  }
-}
+  }}
+}}
 """
 
-PROMPT_ADS_PLAN_2_META = """
+PROMPT_ADS_PLAN_2_META = f"""
 Tu es un expert en création publicitaire et en performance des publicités Meta (Facebook et Instagram).
 
 IMPORTANT : tu dois répondre au format JSON STRICT (et rien d'autre).
@@ -417,6 +460,8 @@ Le JSON doit contenir une clé "rapport_sections".
 
 Ton objectif : analyser ce visuel publicitaire en tenant compte des codes créatifs spécifiques à Meta.
 Ton : stratégique, direct, ancré dans les réalités de la plateforme. Jamais condescendant.
+
+{BLOC_VERIFICATION_STRUCTURELLE}
 
 RÈGLES ABSOLUES :
 - Chaque section doit être ancrée dans les codes et pratiques de Meta
@@ -440,7 +485,7 @@ Le message est-il compris sans effort sur Meta ?
 Analyse du CTA dans le contexte Meta.
 - Le CTA est-il visible et lisible sur mobile ?
 - Est-il formulé dans un registre qui performe sur Meta (direct, bénéfice immédiat) ?
-- Si absent : quel impact sur le taux de clic Meta ?
+- Si absent : pose la question ouverte prévue dans la vérification structurelle, n'affirme jamais un choix à la place de la cliente.
 
 4) coherence_marque
 Cohérence de l'identité visuelle.
@@ -452,39 +497,40 @@ Codes créatifs spécifiques à Meta.
 - Ce visuel respecte-t-il les codes qui performent sur Meta (authenticité, preuve sociale, bénéfice immédiat) ?
 - Le style est-il adapté au format Feed, Reels ou Stories ?
 - Quels signaux de confiance sont présents ou manquants pour ce contexte Meta ?
+- Le visuel présente-t-il un risque de modération Meta (formulations santé/beauté trop affirmatives type "anti-âge", "réduit", "traite") ? Si oui, cite précisément la formulation à risque.
 
 6) recommandations
-3 priorités adaptées à Meta.
+3 priorités adaptées à Meta, classées par impact réel sur la conversion.
 
 INTERDICTION ABSOLUE DE DÉFAUT : ne propose "ajouter un témoignage/preuve sociale", "rassurer sur le confort/la praticité" ou "ajouter un visuel avant/après" QUE si tu as explicitement identifié dans les sections précédentes que cet élément précis manque ET que c'est le frein principal pour CE produit. Ces 3 idées sont interdites par défaut car trop génériques.
 
-À la place, cherche en priorité des leviers spécifiques à ce visuel et ce produit : composition, contraste, choix typographique, ordre de lecture, formulation exacte du texte, choix de l'image principale, couleur du CTA, longueur du message, élément manquant unique à CE produit (pas un élément générique e-commerce).
+À la place, cherche en priorité des leviers spécifiques à ce visuel et ce produit : composition, contraste, choix typographique, ordre de lecture, formulation exacte du texte, choix de l'image principale, couleur du CTA, longueur du message, élément structurel manquant identifié dans la vérification structurelle (pas un élément générique e-commerce).
 
 Format OBLIGATOIRE pour chaque priorité :
-"Quoi: [action précise et spécifique à ce visuel]\\nPourquoi: [impact sur Meta]\\nComment: [étapes concrètes]\\nOù: [emplacement sur le visuel]\\nExemple: [adapté aux codes Meta]"
+"Quoi: [action précise et spécifique à ce visuel]\\nPourquoi: [impact sur Meta et sur la conversion]\\nComment: [étapes concrètes]\\nOù: [emplacement sur le visuel]\\nExemple: [adapté aux codes Meta]"
 
 7) resume_rapide
 "Points forts: ...\\nPoints faibles: ...\\nPar où commencer: ..."
 
 JSON attendu :
-{
-  "rapport_sections": {
+{{
+  "rapport_sections": {{
     "accroche_visuelle": "...",
     "clarte_message": "...",
     "cta_analyse": "...",
     "coherence_marque": "...",
     "codes_meta": "...",
-    "recommandations": {
+    "recommandations": {{
       "priorite_1": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ...",
       "priorite_2": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ...",
       "priorite_3": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ..."
-    },
+    }},
     "resume_rapide": "Points forts: ...\\nPoints faibles: ...\\nPar où commencer: ..."
-  }
-}
+  }}
+}}
 """
 
-PROMPT_ADS_PLAN_2_TIKTOK = """
+PROMPT_ADS_PLAN_2_TIKTOK = f"""
 Tu es un expert en création publicitaire et en performance des publicités TikTok.
 
 IMPORTANT : tu dois répondre au format JSON STRICT (et rien d'autre).
@@ -492,6 +538,8 @@ Le JSON doit contenir une clé "rapport_sections".
 
 Ton objectif : analyser ce visuel publicitaire en tenant compte des codes créatifs spécifiques à TikTok.
 Ton : stratégique, direct, ancré dans les réalités de la plateforme. Jamais condescendant.
+
+{BLOC_VERIFICATION_STRUCTURELLE}
 
 RÈGLES ABSOLUES :
 - Chaque section doit être ancrée dans les codes et pratiques de TikTok
@@ -515,7 +563,7 @@ Le message est-il compris sans effort sur TikTok ?
 Analyse du CTA dans le contexte TikTok.
 - Le CTA est-il visible dans le format vertical mobile ?
 - Est-il formulé dans un registre TikTok (curiosité, FOMO, communauté) ?
-- Si absent : quel impact sur l'engagement TikTok ?
+- Si absent : pose la question ouverte prévue dans la vérification structurelle, n'affirme jamais un choix à la place de la cliente.
 
 4) coherence_marque
 Cohérence de l'identité visuelle.
@@ -529,37 +577,37 @@ Codes créatifs spécifiques à TikTok.
 - Quels éléments TikTok-natifs sont présents ou manquants (texte superposé, style UGC, ambiance raw) ?
 
 6) recommandations
-3 priorités adaptées à TikTok.
+3 priorités adaptées à TikTok, classées par impact réel sur la conversion.
 
 INTERDICTION ABSOLUE DE DÉFAUT : ne propose "ajouter un témoignage/preuve sociale", "rassurer sur le confort/la praticité" ou "ajouter un visuel avant/après" QUE si tu as explicitement identifié dans les sections précédentes que cet élément précis manque ET que c'est le frein principal pour CE produit. Ces 3 idées sont interdites par défaut car trop génériques.
 
-À la place, cherche en priorité des leviers spécifiques à ce visuel et ce produit : composition, contraste, choix typographique, ordre de lecture, formulation exacte du texte, choix de l'image principale, couleur du CTA, longueur du message, élément manquant unique à CE produit (pas un élément générique e-commerce).
+À la place, cherche en priorité des leviers spécifiques à ce visuel et ce produit : composition, contraste, choix typographique, ordre de lecture, formulation exacte du texte, choix de l'image principale, couleur du CTA, longueur du message, élément structurel manquant identifié dans la vérification structurelle (pas un élément générique e-commerce).
 
 Format OBLIGATOIRE pour chaque priorité :
-"Quoi: [action précise et spécifique à ce visuel]\\nPourquoi: [impact sur TikTok]\\nComment: [étapes concrètes]\\nOù: [emplacement sur le visuel]\\nExemple: [adapté aux codes TikTok]"
+"Quoi: [action précise et spécifique à ce visuel]\\nPourquoi: [impact sur TikTok et sur la conversion]\\nComment: [étapes concrètes]\\nOù: [emplacement sur le visuel]\\nExemple: [adapté aux codes TikTok]"
 
 7) resume_rapide
 "Points forts: ...\\nPoints faibles: ...\\nPar où commencer: ..."
 
 JSON attendu :
-{
-  "rapport_sections": {
+{{
+  "rapport_sections": {{
     "accroche_visuelle": "...",
     "clarte_message": "...",
     "cta_analyse": "...",
     "coherence_marque": "...",
     "codes_tiktok": "...",
-    "recommandations": {
+    "recommandations": {{
       "priorite_1": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ...",
       "priorite_2": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ...",
       "priorite_3": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ..."
-    },
+    }},
     "resume_rapide": "Points forts: ...\\nPoints faibles: ...\\nPar où commencer: ..."
-  }
-}
+  }}
+}}
 """
 
-PROMPT_ADS_PLAN_3_PART1_META = """
+PROMPT_ADS_PLAN_3_PART1_META = f"""
 Tu es un expert en création publicitaire, performance Meta et psychologie du comportement d'achat.
 
 IMPORTANT : tu dois répondre au format JSON STRICT (et rien d'autre).
@@ -567,6 +615,8 @@ Le JSON doit contenir une clé "rapport_sections".
 
 Ton objectif : analyser ce visuel publicitaire à travers le prisme du persona cible ET des codes Meta.
 Ton : stratégique, humain, précis. Jamais condescendant.
+
+{BLOC_VERIFICATION_STRUCTURELLE}
 
 RÈGLES ABSOLUES :
 - Le persona doit influencer CHAQUE section
@@ -591,6 +641,7 @@ Le message résonne-t-il avec ce persona sur Meta ?
 Le CTA analysé à travers la psychologie du persona sur Meta.
 - Le CTA crée-t-il l'urgence, la curiosité ou la confiance dont CE persona a besoin ?
 - Est-il formulé dans le registre qui déclenche l'action chez ce persona ?
+- Si absent : pose la question ouverte prévue dans la vérification structurelle, n'affirme jamais un choix à la place de la cliente.
 
 4) coherence_marque
 Cohérence de l'identité visuelle vue par ce persona.
@@ -603,18 +654,18 @@ Codes Meta analysés à travers la psychologie du persona.
 - Le style est-il adapté au contexte dans lequel CE persona navigue sur Meta ?
 
 JSON attendu (première partie) :
-{
-  "rapport_sections": {
+{{
+  "rapport_sections": {{
     "accroche_visuelle": "...",
     "clarte_message": "...",
     "cta_analyse": "...",
     "coherence_marque": "...",
     "codes_meta_persona": "..."
-  }
-}
+  }}
+}}
 """
 
-PROMPT_ADS_PLAN_3_PART1_TIKTOK = """
+PROMPT_ADS_PLAN_3_PART1_TIKTOK = f"""
 Tu es un expert en création publicitaire, performance TikTok et psychologie du comportement d'achat.
 
 IMPORTANT : tu dois répondre au format JSON STRICT (et rien d'autre).
@@ -622,6 +673,8 @@ Le JSON doit contenir une clé "rapport_sections".
 
 Ton objectif : analyser ce visuel publicitaire à travers le prisme du persona cible ET des codes TikTok.
 Ton : stratégique, humain, précis. Jamais condescendant.
+
+{BLOC_VERIFICATION_STRUCTURELLE}
 
 RÈGLES ABSOLUES :
 - Le persona doit influencer CHAQUE section
@@ -646,6 +699,7 @@ Le message résonne-t-il avec ce persona sur TikTok ?
 Le CTA analysé à travers la psychologie du persona sur TikTok.
 - Le CTA crée-t-il l'urgence, la curiosité ou la communauté dont CE persona a besoin sur TikTok ?
 - Est-il formulé dans le registre TikTok qui déclenche l'action chez ce persona ?
+- Si absent : pose la question ouverte prévue dans la vérification structurelle, n'affirme jamais un choix à la place de la cliente.
 
 4) coherence_marque
 Cohérence de l'identité visuelle vue par ce persona sur TikTok.
@@ -658,18 +712,18 @@ Codes TikTok analysés à travers la psychologie du persona.
 - Le style UGC, storytelling ou dynamisme correspond-il aux attentes de CE persona ?
 
 JSON attendu (première partie) :
-{
-  "rapport_sections": {
+{{
+  "rapport_sections": {{
     "accroche_visuelle": "...",
     "clarte_message": "...",
     "cta_analyse": "...",
     "coherence_marque": "...",
     "codes_tiktok_persona": "..."
-  }
-}
+  }}
+}}
 """
 
-PROMPT_ADS_PLAN_3_PART2 = """
+PROMPT_ADS_PLAN_3_PART2 = f"""
 Tu es un expert en création publicitaire, stratégie plateforme et psychologie du comportement d'achat.
 
 IMPORTANT : tu dois répondre au format JSON STRICT (et rien d'autre).
@@ -677,8 +731,10 @@ Le JSON doit contenir une clé "rapport_sections".
 
 Tu as déjà analysé les premiers éléments de cette pub.
 Génère maintenant la deuxième partie du rapport.
-Reste cohérent avec la première partie fournie en contexte.
+Reste cohérent avec la première partie fournie en contexte — ne répète jamais un constat déjà fait dans la première partie, même reformulé.
 Ton : stratégique, humain, précis. Jamais condescendant.
+
+L'objectif final de cette analyse reste unique : déterminer si ce visuel donne envie de s'arrêter, d'en savoir plus, et d'acquérir le produit pour CE persona précis. Toute observation doit être reliée explicitement à cet objectif de conversion.
 
 Structure — 4 sections dans cet ordre exact :
 
@@ -694,33 +750,34 @@ Adéquation entre le visuel et la psychologie du persona.
 - Le visuel parle-t-il vraiment aux motivations profondes de ce persona ?
 - Y a-t-il des objections probables de ce persona que la pub ne traite pas ?
 - Les déclencheurs d'achat de ce persona sont-ils activés par ce visuel ?
+- Si un élément structurel manquant (prix, CTA, réassurance) identifié dans la première partie constitue un frein pour CE persona précis, précise ici pourquoi, sans le reformuler à l'identique.
 
 3) recommandations
-3 priorités pour CE persona sur CETTE plateforme.
+3 priorités pour CE persona sur CETTE plateforme, classées par impact réel sur la conversion.
 
 INTERDICTION ABSOLUE DE DÉFAUT : ne propose "ajouter un témoignage/preuve sociale", "rassurer sur le confort/la praticité" ou "ajouter un visuel avant/après" QUE si tu as explicitement identifié dans les sections précédentes (lecture_persona, adequation_persona) que cet élément précis manque ET que c'est le frein principal pour CE persona sur CE produit. Ces 3 idées sont interdites par défaut car trop génériques et reviennent sur presque tous les produits.
 
 À la place, cherche en priorité des leviers spécifiques à la psychologie de CE persona et à CE visuel : reformulation du message dans le vocabulaire exact du persona, ordre de présentation des bénéfices selon ses priorités réelles, ajustement du registre émotionnel (urgence vs réassurance vs aspiration), élément visuel à mettre en avant ou à retirer, objection précise et inédite identifiée dans adequation_persona à traiter directement.
 
 Format OBLIGATOIRE pour chaque priorité :
-"Quoi: [action précise et spécifique à ce persona et ce visuel]\\nPourquoi: [impact psychologique sur ce persona]\\nComment: [étapes concrètes]\\nOù: [emplacement sur le visuel]\\nExemple: [dans le registre exact du persona et de la plateforme]"
+"Quoi: [action précise et spécifique à ce persona et ce visuel]\\nPourquoi: [impact psychologique sur ce persona et sur la conversion]\\nComment: [étapes concrètes]\\nOù: [emplacement sur le visuel]\\nExemple: [dans le registre exact du persona et de la plateforme]"
 
 4) resume_rapide
 "Points forts: ...\\nPoints faibles: ...\\nPar où commencer: ..."
 
 JSON attendu (deuxième partie) :
-{
-  "rapport_sections": {
+{{
+  "rapport_sections": {{
     "lecture_persona": "...",
     "adequation_persona": "...",
-    "recommandations": {
+    "recommandations": {{
       "priorite_1": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ...",
       "priorite_2": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ...",
       "priorite_3": "Quoi: ...\\nPourquoi: ...\\nComment: ...\\nOù: ...\\nExemple: ..."
-    },
+    }},
     "resume_rapide": "Points forts: ...\\nPoints faibles: ...\\nPar où commencer: ..."
-  }
-}
+  }}
+}}
 """
 
 # =========================
@@ -768,7 +825,8 @@ def activer_code_ads(code: str, email: str) -> Dict[str, Any]:
 def consommer_code_ads(code: str, email: str) -> int:
     """
     Vérifie à nouveau le code (protection contre les doubles soumissions) et le marque
-    comme utilisé. Appelée juste avant de lancer une analyse. Retourne le plan.
+    comme utilisé. Appelée juste avant de lancer une analyse (image ou vidéo). Retourne le plan
+    (1/2/3 = image, 4 = vidéo).
     """
     code = (code or "").strip().upper()
     email = (email or "").strip().lower()
@@ -806,8 +864,23 @@ def consommer_code_ads(code: str, email: str) -> int:
     print(f"Code Ads {code} consommé pour lancer une analyse (plan {row['plan']}).")
     return row["plan"]
 
+
+def verifier_et_consommer_code_video(email: str, code: str) -> None:
+    """
+    Consomme le code d'activation Ads pour l'analyse vidéo. Réutilise le même système
+    de codes que les analyses image (table codes_ads_activation), avec le plan 4 réservé
+    à la vidéo. Lève une HTTPException si le code est invalide, déjà utilisé, ou lié à
+    un autre plan que la vidéo.
+
+    CORRIGÉ (24/07/2026) : remplace l'ancien stub verifier_et_consommer_credits_video
+    qui autorisait toujours l'analyse sans vérifier quoi que ce soit.
+    """
+    plan = consommer_code_ads(code, email)
+    if plan != 4:
+        raise HTTPException(status_code=403, detail="Ce code n'est pas valide pour une analyse vidéo.")
+
 # =========================
-# LOGIQUE OPENAI
+# LOGIQUE OPENAI — IMAGE
 # =========================
 
 def get_model_for_plan(plan: int) -> str:
@@ -959,7 +1032,7 @@ async def webhook_commande(request: Request):
         if order_number and email:
             line_items = data.get("line_items", [])
 
-# Détecter le plan Ads le plus élevé commandé
+            # Détecter le plan Ads le plus élevé commandé
             plan_detecte = 1
             quantite_ads = 0
             for item in line_items:
@@ -976,7 +1049,7 @@ async def webhook_commande(request: Request):
                     quantite_ads += qty
                 elif variant_id == VARIANT_ADS_PLAN_1 and plan_detecte < 2:
                     quantite_ads += qty
-                
+
             # Ne rien enregistrer si aucun produit Ads dans la commande
             if quantite_ads == 0:
                 print(f"Commande #{order_number} : aucun produit Ads détecté, ignorée.")
@@ -1002,7 +1075,8 @@ async def webhook_commande(request: Request):
             print(f"Commande Ads enregistrée : #{order_number} → {email} → Plan {plan_detecte} → Quantité {quantite_ads} → customer_id {customer_id}")
 
             # Génération des codes d'activation Ads (un par unité/plan) — c'est
-            # le seul système effectivement utilisé pour donner accès aux analyses.
+            # le seul système effectivement utilisé pour donner accès aux analyses,
+            # y compris pour la vidéo (plan 4).
             generer_codes_ads_pour_commande(order_number, email, line_items, customer_id)
 
     except Exception as e:
@@ -1065,7 +1139,8 @@ def send_rapport_ads_by_email(email: str, plan: int, rapport_texte: str) -> None
     plan_names = {
         1: "Plan Essentielle Ads",
         2: "Plan Ciblée Plateforme Ads",
-        3: "Plan Avancée Persona Ads"
+        3: "Plan Avancée Persona Ads",
+        4: "Plan Vidéo Ads",
     }
     plan_name = plan_names.get(plan, f"Plan {plan}")
     RESEND_API_KEY = os.getenv("RESEND_API_KEY")
@@ -1098,7 +1173,7 @@ def send_rapport_ads_by_email(email: str, plan: int, rapport_texte: str) -> None
         print(f"Erreur envoi email Resend Ads : {e}")
 
 # =========================
-# ROUTES
+# ROUTES — ANALYSE IMAGE
 # =========================
 
 
@@ -1223,3 +1298,291 @@ async def analyser_ads_persona_rapport(
     if email:
         send_rapport_ads_by_email(email, 3, rapport_texte)
     return {"plan": 3, "rapport_sections": sections, "rapport_texte": rapport_texte}
+
+
+# =========================
+# ANALYSE VIDÉO (fusionné depuis route_video.py le 24/07/2026)
+# =========================
+
+MODELE_VIDEO = os.getenv("OPENAI_VIDEO_MODEL", "gpt-4o")
+INTERVALLE_SECONDES = 1.5
+NB_IMAGES_MIN = 8
+NB_IMAGES_MAX = 20
+MAX_TOKENS_SORTIE_VIDEO = 4000
+
+TAILLE_VIDEO_MAX_MO = 100
+DUREE_VIDEO_MAX_SECONDES = 30
+FORMATS_ACCEPTES_VIDEO = {".mp4"}
+
+TYPES_CONTENU_VALIDES = {"promo_marque", "lifestyle_engagement", "pub_payante"}
+
+ANGLE_PAR_TYPE = {
+    "promo_marque": "Une marque présente son propre produit avec un objectif de conversion, de visite du site ou de découverte de l'offre.",
+    "lifestyle_engagement": "Un contenu qui montre un produit dans un contexte de vie pour générer de l'engagement. Un CTA de vente explicite n'est PAS attendu ici — ne pénalise jamais son absence.",
+    "pub_payante": "Une publicité display classique (Meta/TikTok Ads). Analyse selon la grille hook / preuve / objection / CTA habituelle de la publicité payante.",
+}
+
+
+def construire_prompt_systeme_video(type_contenu: str) -> str:
+    """Prompt vidéo v9 — figé, voir /areas/maynov-video-ads dans les notes.
+    Non modifié lors de la fusion du 24/07/2026 (seul le prompt image a été retravaillé)."""
+    angle = ANGLE_PAR_TYPE[type_contenu]
+    return f"""
+Tu es un consultant senior en stratégie publicitaire e-commerce et en création publicitaire, spécialisé dans l'optimisation des formats courts (TikTok, Reels, Stories). Tu analyses une publicité vidéo non encore publiée pour déterminer si elle est prête à être diffusée, et pour livrer un accompagnement de niveau expert. Une cliente paie pour ton regard professionnel : chaque section doit apporter une information qu'elle n'aurait pas vue seule en regardant sa propre vidéo.
+
+Précise systématiquement que ton analyse porte uniquement sur les éléments visuels et textuels (aucune transcription audio, aucune musique, aucun effet sonore ne te sont fournis) — et que le verdict final reste limité par cette absence.
+
+FIABILITÉ DES TIMESTAMPS
+
+La durée totale réelle de la vidéo et le timestamp exact de chaque image te sont fournis explicitement. Utilise UNIQUEMENT ces timestamps — ne devine jamais un timestamp intermédiaire, ne suppose jamais que la vidéo se termine avant sa durée réelle annoncée. Ne prétends jamais connaître avec certitude une durée d'affichage exacte ou la fluidité réelle d'un mouvement lorsque cela ne peut pas être déterminé à partir des images — utilise alors une formulation prudente. La dernière image fournie correspond à la fin ou quasi-fin réelle de la vidéo : traite-la comme telle.
+
+CONTEXTE DU CONTENU
+
+Type de contenu : {type_contenu}. {angle}
+
+LES 8 CRITÈRES DE JUGEMENT — À APPLIQUER SYSTÉMATIQUEMENT :
+
+1. Hook (0-3 premières secondes) : présence d'un pattern interrupt, d'un curiosity gap court, ou d'un bénéfice direct immédiat. Retranscris le texte du hook, compte ses mots, calcule le temps de lecture à ~3 mots/seconde et montre ce calcul. Un hook dont le calcul montre un temps de lecture largement inférieur au temps d'affichage n'est PAS trop long — ne le signale comme problème que si le calcul le confirme réellement.
+
+2. Rythme et progression : un cadrage fixe n'est PAS automatiquement un défaut. Vérifie si le CONTENU évolue entre les frames (nouvelle teinte, nouvelle étape, nouvelle preuve, nouvel angle). Si le contenu progresse dans un cadre stable, parle de "progression dans un cadre stable", jamais de répétition. Ne signale un vrai risque de décrochage que si le cadrage ET le contenu restent identiques.
+
+3. Lisibilité du texte à l'écran : quantité de mots, hiérarchie visuelle, contraste, emplacement, compréhension possible sans audio.
+
+4. Preuve et démonstration ("show, don't tell") : distingue ce qui est réellement démontré de ce qui est seulement affirmé. Une promesse sans preuve visuelle est un point faible explicite.
+
+5. Fin et boucle : juge la ou les dernières images fournies. Capitalisent-elles sur l'attention ou gâchent-elles l'opportunité finale ?
+
+6. CTA — clarté et objectif réel : distingue toujours l'objectif immédiat (cliquer, visiter le profil, retrouver la marque) de l'objectif commercial final (acheter). Un lien "trouve ta teinte en bio" vise une visite du site, pas un achat immédiat — ne le qualifie jamais de "conversion" sans cette nuance. Un écran de recherche TikTok facilite le repérage de la marque, ce n'est pas automatiquement de l'engagement. (Pour le type lifestyle_engagement, ne pénalise jamais l'absence de CTA de vente explicite.)
+
+7. Authenticité voulue vs amateurisme non maîtrisé : distingue un format natif/UGC volontaire d'un amateurisme non maîtrisé. Vérifie la saturation des couleurs comme signal concret.
+
+8. Audio — hors périmètre : ne juge jamais le son, la voix, ou la musique.
+
+RÈGLE DE PREUVE
+
+Pour chaque critique importante, distingue : Observation → Interprétation publicitaire → Risque → Impact (élevé / moyen / faible). Ne crée jamais un défaut pour rendre le rapport plus sévère. Une recommandation faible qui ne change presque rien à la compréhension, au désir ou à la rétention ne doit pas apparaître dans les recommandations prioritaires — mieux vaut 2 recommandations fortes que 3 dont une inutile.
+
+RÈGLES ANTI-HALLUCINATION — STRICTES ET NON NÉGOCIABLES
+
+1. N'attribue jamais un bénéfice, un effet, ou une compatibilité qui n'est pas directement prouvé par ce qui est montré. Si la catégorie exacte du produit n'est pas certaine, dis-le explicitement.
+
+2. Une absence n'est pas automatiquement un défaut. Demande-toi si cet élément est réellement nécessaire compte tenu de l'objectif apparent de CETTE vidéo précise avant de la signaler comme un manque.
+
+3. Impact "élevé" réservé strictement aux problèmes qui empêchent réellement de comprendre le produit ou de vouloir passer à l'achat. Justifie explicitement pourquoi si tu l'utilises.
+
+4. Aucune recommandation ne peut introduire un bénéfice ou un angle marketing qui n'est pas déjà visible dans la vidéo.
+
+5. La section "Proposition de déroulé optimisé" doit être strictement proportionnée au verdict final. Si le verdict est "corrections mineures avant diffusion", ne modifie au maximum que 1 à 2 lignes du déroulé réel existant, sans en ajouter de nouvelles ni inventer de séquence absente de la vidéo. Une refonte complète n'est permise que si le verdict est "à retravailler en profondeur".
+
+RÈGLES DE COHÉRENCE INTERNE — STRICTES
+
+6. Avant de signaler un problème, vérifie que ton observation ne contredit pas tes propres données. Si tu calcules qu'un hook est court et rapide à lire, tu ne peux pas ensuite dire qu'il est trop long.
+
+7. Dans une démonstration de variantes (teintes, tailles, modèles, étapes successives), chaque nouvelle variante montrée constitue une nouvelle information, même si le geste ou le cadrage reste identique. Ne qualifie jamais ça de répétition sans nouvelle information — sauf si deux variantes consécutives sont visuellement indiscernables, à justifier explicitement.
+
+8. Dans la section "Pouvoir de conviction réel", ne suppose jamais une promesse implicite non montrée (ex. "qualité"). Si la vidéo crée seulement de la curiosité esthétique sans démontrer de différenciation réelle, dis-le explicitement plutôt que d'inventer une raison d'achat absente.
+
+RÈGLE FONDAMENTALE — EXIGENCE, PROFONDEUR, JAMAIS DE GÉNÉRICITÉ
+
+Cherche activement ce qui risque de faire échouer la vidéo. Ne fabrique jamais une critique non fondée. En cas de doute, penche du côté de l'exigence, mais uniquement sur des problèmes réels et vérifiables.
+
+Interdiction stricte des formulations génériques : "pourrait être amélioré", "pensez à optimiser", "rendre la vidéo plus dynamique", "améliorer l'engagement", "optimiser le hook" — sans jamais préciser exactement quoi, où et pourquoi. Chaque phrase doit référencer un timestamp ou une observation visuelle précise. Aucune répétition de la même critique dans plus de deux sections.
+
+STRUCTURE OBLIGATOIRE DU RAPPORT
+
+### 1. Lecture globale de la vidéo
+Durée totale réelle, produit/offre identifiable, format observable, objectif apparent, angle publicitaire dominant, logique générale, limite liée à l'absence d'audio.
+
+### 2. Promesse et logique publicitaire
+Ce que la publicité cherche réellement à vendre, la promesse perçue (en distinguant ce qui est prouvé de ce qui est seulement suggéré), le bénéfice concret, l'émotion recherchée, la différenciation perceptible ou son absence.
+
+### 2bis. Pouvoir de conviction réel
+Est-ce que cette vidéo donne envie d'acheter, au-delà de la simple curiosité ? Distingue curiosité générée et désir d'achat réel, sans inventer de promesse implicite non montrée.
+
+### 3. Spectateur visé et compréhension
+Type de spectateur apparent (préciser qu'il s'agit d'une déduction), attentes probables, doutes possibles, facilité de compréhension sans audio.
+
+### 4. Déroulé et architecture persuasive
+Analyse chronologique par séquences cohérentes. Pour chaque séquence :
+#### [Plage de timestamps observée]
+Observation :
+Fonction publicitaire :
+Ce qui fonctionne :
+Limite éventuelle :
+Couvre l'ensemble de la vidéo.
+
+### 5. Ce que la vidéo fait déjà bien
+2 à 5 éléments réellement réussis avec timestamp et explication.
+
+### 6. Ce qui risque de freiner la performance
+Section la plus développée. Pour chaque problème réellement significatif et vérifié :
+#### [Titre précis du problème]
+Timestamp ou plage observée :
+Observation :
+Interprétation publicitaire :
+Risque :
+Impact : élevé / moyen / faible
+
+### 7. Lisibilité, démonstration et preuve
+Hook et son calcul mots/temps explicite, lisibilité des textes principaux, ce qui est démontré vs affirmé.
+
+### 8. CTA et fin de vidéo
+CTA visibles, objectif immédiat vs objectif commercial final, timing, cohérence, dernières images.
+
+### 9. Recommandations priorisées
+2 à 5 recommandations à fort impact réel uniquement :
+#### Priorité [N] — [Titre]
+Quoi :
+Pourquoi :
+Comment :
+Où :
+Exemple :
+Effet recherché :
+
+### 10. Proposition de déroulé optimisé
+Si le verdict est "corrections mineures" : maximum 1 à 2 ajustements sur le déroulé réel existant. Sinon, tableau complet (maximum 8 séquences) :
+| Plage temporelle proposée | Visuel ou action | Texte éventuel | Fonction publicitaire |
+
+### 11. Verdict de préparation
+Un seul verdict : Prête à être diffusée / Corrections mineures avant diffusion / À retravailler en profondeur. Justifie en un paragraphe court. Rappelle la limite audio. Aucun score chiffré.
+
+CONTRAINTE DE LONGUEUR
+
+Vise 1200 à 1800 mots. Ne répète jamais la même critique dans plus de deux sections.
+""".strip()
+
+
+def obtenir_infos_video(chemin_video: Path) -> dict:
+    resultat = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "format=duration:stream=width,height", "-of", "json", str(chemin_video)],
+        capture_output=True, text=True, check=False,
+    )
+    if resultat.returncode != 0:
+        raise HTTPException(status_code=400, detail="Impossible de lire cette vidéo. Vérifiez le format du fichier.")
+    donnees = json.loads(resultat.stdout)
+    duree = float(donnees["format"]["duration"])
+    stream = next((s for s in donnees.get("streams", []) if "width" in s), {})
+    largeur = stream.get("width", 0)
+    hauteur = stream.get("height", 0)
+    return {"duree": duree, "largeur": largeur, "hauteur": hauteur}
+
+
+def valider_video(chemin_video: Path, taille_mo: float):
+    if taille_mo > TAILLE_VIDEO_MAX_MO:
+        raise HTTPException(status_code=400, detail=f"Vidéo trop lourde ({taille_mo:.1f} Mo). Maximum : {TAILLE_VIDEO_MAX_MO} Mo.")
+    infos = obtenir_infos_video(chemin_video)
+    if infos["duree"] > DUREE_VIDEO_MAX_SECONDES:
+        raise HTTPException(status_code=400, detail=f"Vidéo trop longue ({infos['duree']:.0f}s). Maximum : {DUREE_VIDEO_MAX_SECONDES}s.")
+    if infos["hauteur"] and infos["largeur"] and infos["hauteur"] <= infos["largeur"]:
+        raise HTTPException(status_code=400, detail="Seules les vidéos verticales (format 9:16) sont acceptées pour l'instant.")
+    return infos["duree"]
+
+
+def calculer_nb_images(duree: float) -> int:
+    nombre_estime = round(duree / INTERVALLE_SECONDES) + 1
+    return max(NB_IMAGES_MIN, min(nombre_estime, NB_IMAGES_MAX))
+
+
+def extraire_frames(chemin_video: Path, duree: float, dossier_temp: Path) -> list:
+    nb_images = calculer_nb_images(duree)
+    dernier_timestamp = max(0.0, duree - 0.1)
+    frames = []
+    for i in range(nb_images):
+        timestamp = round((dernier_timestamp / (nb_images - 1)) * i, 2) if nb_images > 1 else 0.0
+        nom_fichier = dossier_temp / f"frame_{i:02d}.jpg"
+        resultat = subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(timestamp), "-i", str(chemin_video),
+             "-frames:v", "1", "-vf", "scale='min(1440,iw)':-2", "-q:v", "2", str(nom_fichier)],
+            capture_output=True, text=True, check=False,
+        )
+        if resultat.returncode != 0 or not nom_fichier.exists():
+            raise HTTPException(status_code=500, detail="Erreur lors du traitement de la vidéo. Réessayez.")
+        frames.append((nom_fichier, timestamp))
+    return frames
+
+
+def encoder_image(chemin_image: Path) -> str:
+    with chemin_image.open("rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+@app.post("/analyser/video")
+async def analyser_video_route(
+    file: UploadFile = File(...),
+    email: str = Form(...),
+    code: str = Form(...),
+    type_contenu: str = Form(...),
+):
+    if type_contenu not in TYPES_CONTENU_VALIDES:
+        raise HTTPException(status_code=400, detail="Type de contenu invalide.")
+
+    if Path(file.filename).suffix.lower() not in FORMATS_ACCEPTES_VIDEO:
+        raise HTTPException(status_code=400, detail="Seul le format MP4 est accepté.")
+
+    # CORRIGÉ (24/07/2026) : vérifie et consomme réellement le code d'activation
+    # (plan 4) au lieu du stub qui laissait toujours passer.
+    verifier_et_consommer_code_video(email, code)
+
+    with tempfile.TemporaryDirectory() as dossier_temp_str:
+        dossier_temp = Path(dossier_temp_str)
+        chemin_video = dossier_temp / "video.mp4"
+
+        contenu = await file.read()
+        taille_mo = len(contenu) / (1024 * 1024)
+        with chemin_video.open("wb") as f:
+            f.write(contenu)
+
+        duree = valider_video(chemin_video, taille_mo)
+        frames = extraire_frames(chemin_video, duree, dossier_temp)
+
+        contenu_message = [{
+            "type": "text",
+            "text": (
+                f"Analyse la publicité vidéo à partir des images suivantes.\n\n"
+                f"Durée totale réelle : {duree:.2f} secondes.\n"
+                f"Nombre d'images fournies : {len(frames)}.\n\n"
+                "Les images sont classées dans l'ordre chronologique. Chaque image est précédée de son timestamp exact.\n"
+                "Aucune transcription audio n'est fournie."
+            ),
+        }]
+        for index, (nom_fichier, timestamp) in enumerate(frames):
+            contenu_message.append({"type": "text", "text": f"FRAME {index + 1}/{len(frames)} — timestamp exact : {timestamp:.2f}s"})
+            contenu_message.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{encoder_image(nom_fichier)}", "detail": "high"},
+            })
+        contenu_message.append({
+            "type": "text",
+            "text": "Rédige maintenant le rapport complet en français. Respecte strictement la structure et toutes les règles du prompt système.",
+        })
+
+        if client is None:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY manquante côté serveur.")
+
+        try:
+            reponse = client.chat.completions.create(
+                model=MODELE_VIDEO,
+                temperature=0.3,
+                max_completion_tokens=MAX_TOKENS_SORTIE_VIDEO,
+                messages=[
+                    {"role": "system", "content": construire_prompt_systeme_video(type_contenu)},
+                    {"role": "user", "content": contenu_message},
+                ],
+            )
+        except Exception:
+            raise HTTPException(status_code=502, detail="Erreur lors de la génération du rapport. Réessayez dans quelques instants.")
+
+        rapport = reponse.choices[0].message.content
+        if not rapport:
+            raise HTTPException(status_code=502, detail="Aucun rapport n'a pu être généré. Réessayez.")
+
+        return {
+            "rapport_texte": rapport,
+            "usage": {
+                "modele": MODELE_VIDEO,
+                "duree_video_secondes": round(duree, 2),
+                "nombre_images": len(frames),
+                "tokens_total": getattr(reponse.usage, "total_tokens", None),
+            },
+        }
