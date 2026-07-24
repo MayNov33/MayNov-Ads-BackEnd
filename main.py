@@ -113,23 +113,26 @@ def generer_code_ads() -> str:
 
 
 def generer_codes_ads_pour_commande(order_number: str, email: str, line_items: list, customer_id: Optional[str] = None) -> None:
-    """
-    Pour chaque ligne de la commande Ads, génère un code d'activation par unité achetée,
-    lié au bon plan. customer_id est l'ID Shopify du client si connecté au moment de
-    l'achat (None sinon) - purement informatif, ne conditionne pas l'accès.
-
-    Plan 1/2/3 = analyses image (Essentielle/Ciblée/Persona).
-    Plan 4 = analyse vidéo. CORRIGÉ (24/07/2026) : cette branche manquait,
-    donc aucun code n'était jamais généré ni envoyé pour les achats vidéo.
-    """
     if not DATABASE_URL:
         print("DATABASE_URL manquante, génération de codes Ads ignorée.")
         return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Protection anti-duplication : Shopify peut renvoyer le même webhook
+    # plusieurs fois (retry). Si des codes existent déjà pour cette commande,
+    # on ne régénère rien.
+    cur.execute("SELECT COUNT(*) FROM codes_ads_activation WHERE order_number = %s", (order_number,))
+    (nb_codes_existants,) = cur.fetchone()
+    if nb_codes_existants > 0:
+        print(f"Commande #{order_number} : {nb_codes_existants} code(s) déjà généré(s), webhook dupliqué ignoré.")
+        cur.close()
+        conn.close()
+        return
+
     codes_generes = []
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
         for item in line_items:
             variant_id = str(item.get("variant_id", ""))
             quantite = int(item.get("quantity", 1))
@@ -143,7 +146,7 @@ def generer_codes_ads_pour_commande(order_number: str, email: str, line_items: l
             elif variant_id == VARIANT_ADS_PLAN_1:
                 plan_item = 1
             else:
-                continue  # produit non-Ads dans la commande, on l'ignore
+                continue
 
             for _ in range(max(quantite, 1)):
                 code = generer_code_ads()
@@ -166,8 +169,9 @@ def generer_codes_ads_pour_commande(order_number: str, email: str, line_items: l
             send_codes_ads_by_email(email, order_number, codes_generes)
 
     except Exception as e:
+        cur.close()
+        conn.close()
         print(f"Erreur génération codes Ads pour commande #{order_number} : {e}")
-
 def send_codes_ads_by_email(email: str, order_number: str, codes: list) -> None:
     plan_names = {
         1: "Plan Essentielle Ads",
