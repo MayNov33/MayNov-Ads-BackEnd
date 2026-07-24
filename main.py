@@ -1580,9 +1580,8 @@ async def analyser_video_route(
         rapport = reponse.choices[0].message.content
         if not rapport:
             raise HTTPException(status_code=502, detail="Aucun rapport n'a pu être généré. Réessayez.")
-if email:
+        if email:
             send_rapport_ads_by_email(email, 4, rapport)
-
         return {
             "rapport_texte": rapport,
             "usage": {
