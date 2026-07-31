@@ -1001,6 +1001,71 @@ def call_openai_ads(
     sections_complete = {**sections_part1, **sections_part2}
     return {"rapport_sections": sections_complete}
 
+ABONNEMENTS_DATABASE_URL = os.getenv("ABONNEMENTS_DATABASE_URL")
+
+def get_abonnements_db_connection():
+    if not ABONNEMENTS_DATABASE_URL:
+        raise HTTPException(status_code=500, detail="ABONNEMENTS_DATABASE_URL manquante.")
+    return psycopg2.connect(ABONNEMENTS_DATABASE_URL)
+
+
+def get_cout_credits_ads_abonnements(customer_id: str, produit: str, identifiant: str) -> int:
+    conn = get_abonnements_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT cout FROM cout_credits_par_plan WHERE produit = %s AND identifiant = %s",
+        (produit, identifiant),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if row is None:
+        raise HTTPException(status_code=500, detail=f"Coût en crédits non configuré pour {produit}/{identifiant}.")
+    return row[0]
+
+
+def debiter_credits_abonnement(customer_id: str, produit: str, cout: int) -> int:
+    conn = get_abonnements_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT solde_abonnement_mensuel, solde_achete FROM soldes_abonnement WHERE customer_id = %s AND produit = %s",
+        (customer_id, produit),
+    )
+    row = cur.fetchone()
+    if row is None:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Aucun crédit disponible pour ce produit.")
+
+    solde_mensuel, solde_achete = row
+    solde_total = solde_mensuel + solde_achete
+    if solde_total < cout:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Solde de crédits insuffisant pour cette profondeur.")
+
+    # On consomme d'abord le solde mensuel, puis le solde acheté
+    if solde_mensuel >= cout:
+        nouveau_mensuel = solde_mensuel - cout
+        nouveau_achete = solde_achete
+    else:
+        reste = cout - solde_mensuel
+        nouveau_mensuel = 0
+        nouveau_achete = solde_achete - reste
+
+    cur.execute(
+        "UPDATE soldes_abonnement SET solde_abonnement_mensuel = %s, solde_achete = %s WHERE customer_id = %s AND produit = %s",
+        (nouveau_mensuel, nouveau_achete, customer_id, produit),
+    )
+    cur.execute(
+        "INSERT INTO mouvements_points (customer_id, produit, type, montant, solde_apres, detail) VALUES (%s, %s, %s, %s, %s, %s)",
+        (customer_id, produit, "consommation", -cout, nouveau_mensuel + nouveau_achete, f"analyse_profondeur_{cout}"),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return solde_total
+    
 # =========================
 # WEBHOOK SHOPIFY ADS
 # =========================
@@ -1591,3 +1656,40 @@ async def analyser_video_route(
                 "tokens_total": getattr(reponse.usage, "total_tokens", None),
             },
         }
+@app.post("/analyser/ads/abonnement/rapport")
+async def analyser_ads_abonnement_rapport(
+    file: UploadFile = File(...),
+    customer_id: str = Form(...),
+    profondeur: int = Form(...),
+    plateforme: Optional[str] = Form(None),
+    persona: Optional[str] = Form(None),
+):
+    if profondeur not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="Profondeur invalide pour une analyse image (1, 2 ou 3).")
+    if profondeur in (2, 3) and plateforme not in ("meta", "tiktok"):
+        raise HTTPException(status_code=400, detail="Plateforme invalide. Valeurs acceptées : meta, tiktok.")
+    if profondeur == 3 and (not persona or not persona.strip()):
+        raise HTTPException(status_code=400, detail="Persona manquant pour cette profondeur.")
+
+    identifiant_cout = str(profondeur)
+    cout = get_cout_credits_ads_abonnements(customer_id, "ads", identifiant_cout)
+
+    solde_avant = debiter_credits_abonnement(customer_id, "ads", cout)
+
+    image_base64, image_type = await read_and_encode_image(file)
+    data = call_openai_ads(
+        plan=profondeur,
+        image_base64=image_base64,
+        image_type=image_type,
+        plateforme=plateforme,
+        persona=persona,
+    )
+    sections = data["rapport_sections"]
+    rapport_texte = sections_to_plain_text_ads(sections)
+
+    return {
+        "plan": profondeur,
+        "rapport_sections": sections,
+        "rapport_texte": rapport_texte,
+        "solde_restant": solde_avant - cout,
+    }
